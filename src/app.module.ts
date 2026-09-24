@@ -3,11 +3,13 @@ import { APP_GUARD } from '@nestjs/core';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { ThrottlerStorageRedisService } from '@nest-lab/throttler-storage-redis';
 import { HealthController } from './health/health.controller';
 import { UsersModule } from './users/users.module';
 import { LeaderboardModule } from './leaderboard/leaderboard.module';
 import { CacheModule } from './cache/cache.module';
 import { CacheWarmerService } from './cache/cache-warmer.service';
+import { RedisCacheService } from './cache/redis-cache.service';
 import { User } from './users/user.entity';
 
 @Module({
@@ -30,10 +32,17 @@ import { User } from './users/user.entity';
       }),
     }),
     TypeOrmModule.forFeature([User]),
-    ThrottlerModule.forRoot({
-      throttlers: [{ ttl: 60000, limit: 100 }],
-    }),
     CacheModule,
+    // Redis-backed throttler: rate limits are global across all instances.
+    // Without this, each ECS task has its own counter and limits are per-instance.
+    ThrottlerModule.forRootAsync({
+      imports: [CacheModule],
+      inject: [RedisCacheService],
+      useFactory: (redisCache: RedisCacheService) => ({
+        throttlers: [{ ttl: 60000, limit: 100 }],
+        storage: new ThrottlerStorageRedisService(redisCache.getClient()),
+      }),
+    }),
     UsersModule,
     LeaderboardModule,
   ],

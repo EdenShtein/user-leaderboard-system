@@ -111,6 +111,7 @@ Production AWS architecture for the leaderboard system, supporting 10M+ users wi
 | Node type | `cache.r6g.large` | 13 GB memory |
 | Cluster mode | **Disabled** (single-shard + replica) | Lua scripts access multiple keys (`leaderboard:scores`, `leaderboard:members`) — must be on the same shard |
 | Replicas | 1 | Read scaling + automatic failover |
+| Eviction policy | `volatile-ttl` | Protects the ZSET and members hash (no TTL, never evicted). Only user-data hashes (24h TTL) are eviction candidates under memory pressure. Configure via ElastiCache parameter group: `maxmemory-policy = volatile-ttl`. |
 | Encryption | In-transit + at-rest | Security compliance |
 
 **Why single-shard, not cluster mode:** Our FIFO Lua script atomically touches both the sorted set and the members hash. In Redis Cluster, multi-key operations require all keys on the same shard (via hash tags). Single-shard with a replica is simpler and sufficient — 10M users with member-encoded FIFO members (~80 bytes each) ≈ 1.5 GB, well within the 13 GB node.
@@ -201,3 +202,103 @@ GitHub Push → CodePipeline → CodeBuild (test + build) → ECR → ECS Rollin
 | Redis memory > 70% | Vertical: upgrade to cache.r6g.xlarge (26 GB) |
 | Users > 50M | Evaluate Redis Cluster mode with hash-tagged keys, or partition leaderboard by region |
 | Global latency requirements | Multi-region: Route 53 latency routing + cross-region RDS read replicas |
+
+---
+
+## Scaling to 100M Users
+
+The current architecture is sized for 10M users. At 100M the bottlenecks shift. Below is a concrete upgrade path for each layer.
+
+### 10M vs 100M: At a Glance
+
+| Layer | 10M Config | 10M Load | 100M Config | 100M Load |
+|-------|-----------|----------|-------------|-----------|
+| **Redis** | cache.r6g.large (13 GB) | ~2.1 GB used | cache.r6g.2xlarge (52 GB) | ~21 GB used |
+| **PostgreSQL** | db.r6g.xlarge (32 GB) | ~4 GB table+index | db.r6g.4xlarge (128 GB) | ~42 GB table+index |
+| **ECS tasks** | 2–20 tasks | ~20k req/s origin | 2–60 tasks | ~60k req/s origin |
+| **Read replicas** | 1 | Adequate | 2–3 behind reader endpoint | Distributes PG fallback load |
+| **PG IOPS** | gp3 3,000 baseline | Adequate | gp3 6,000–16,000 provisioned | Higher write concurrency |
+
+### Redis: Memory and Cluster Mode
+
+**Memory estimate at 100M users:**
+
+| Data Structure | Per-Entry | 100M Users |
+|----------------|-----------|------------|
+| ZSET (`leaderboard:scores`) | ~80 bytes | ~8 GB |
+| Hash (`leaderboard:members`) | ~70 bytes | ~7 GB |
+| Hashes (`leaderboard:user:*`) | ~60 bytes | ~6 GB |
+| **Total** | | **~21 GB** |
+
+`cache.r6g.large` (13 GB) is insufficient at 100M. Upgrade to `cache.r6g.xlarge` (26 GB) for comfortable headroom, or `cache.r6g.2xlarge` (52 GB) if rapid user growth is expected.
+
+**Redis Cluster mode** becomes relevant above ~50M users to distribute write throughput across multiple shards. However, our Lua scripts atomically access two keys (`leaderboard:scores` and `leaderboard:members`). In Cluster mode, both keys must land on the same shard.
+
+To enable Cluster mode, prefix both keys with the same hash tag:
+```
+{leaderboard}:scores   ← was: leaderboard:scores
+{leaderboard}:members  ← was: leaderboard:members
+```
+
+Redis hashes keys inside `{}` for slot assignment, ensuring both keys share the same shard. This is a key rename + data migration and requires updating `redis-cache.service.ts` constants and the existing ZSET/hash data.
+
+**Recommended upgrade path:**
+1. First: Vertical scale (r6g.xlarge → r6g.2xlarge). No code changes.
+2. Then: Redis Cluster with hash tags if write throughput exceeds single-node capacity (~100k ops/s).
+
+### PostgreSQL: Memory and IOPS
+
+**Data size at 100M users:**
+- Table: 100M × ~200 bytes ≈ 20 GB
+- Composite index `(score DESC, updatedAt ASC, id ASC)`: 100M × ~220 bytes ≈ 22 GB
+- **Total: ~42 GB**
+
+`db.r6g.xlarge` has 32 GB RAM with `shared_buffers = 8 GB`. The full index (22 GB) cannot fit in the buffer pool → index scans require disk reads → latency increases under mixed workload.
+
+Upgrade to `db.r6g.4xlarge` (128 GB RAM, `shared_buffers = 32 GB`). At this size the entire index fits in memory, maintaining sub-millisecond index lookups.
+
+**IOPS:** At 100M active users with ~5,000 concurrent score updates per second, gp3 baseline (3,000 IOPS) is the bottleneck. Configure provisioned IOPS:
+- `gp3` with 6,000–16,000 IOPS: cheaper, covers most cases
+- `io2 Block Express` at 64,000 IOPS: for extreme write throughput
+
+### ECS Fargate: Task Count
+
+Raise `max_tasks` from 20 to 50–60. Keep `min_tasks` at 2 (one per AZ). Auto-scaling on CPU > 60% or ALB `RequestCountPerTarget` remains unchanged.
+
+At 100 tasks × 10 PG connections = 1,000 connections — well within `db.r6g.4xlarge` capacity (~15,000). If task count grows beyond 200, add **AWS RDS Proxy** (PgBouncer-as-a-service) to multiplex connections and reduce the per-task connection overhead.
+
+### Read Replicas
+
+Add 2–3 read replicas behind the RDS **reader endpoint** (DNS load-balances across replicas). `LeaderboardService`'s PG fallback path should target the reader endpoint, not the primary writer. This isolates leaderboard fallback reads from write traffic on the primary.
+
+RDS reader endpoint failover is automatic — if one replica fails, the reader endpoint routes to the remaining replicas within seconds.
+
+### CloudFront at 100M
+
+No changes needed. CloudFront scales horizontally across edge PoPs by design. At 100M users with higher read traffic (10M+ DAU), reduce the TTL on `/leaderboard/top` to 2–3 seconds for fresher data at the cost of slightly more origin traffic — still well within the ALB's capacity with 50–60 ECS tasks.
+
+### Connection Pooling at Scale
+
+```
+100 tasks × 10 connections = 1,000 total PG connections
+db.r6g.4xlarge max_connections ≈ 15,000
+Headroom: 14,000 connections — ample
+
+If tasks grow to 300+:
+  → Add AWS RDS Proxy (PgBouncer):
+     300 tasks × 10 connections = 3,000 proxy connections
+     RDS Proxy → PG Primary: ~100 persistent connections
+     PG Primary sees 100 connections regardless of pod count
+```
+
+### Updated Cost Estimate at 100M Users (Monthly)
+
+| Component | Spec | Cost |
+|-----------|------|------|
+| ECS Fargate | 4–15 tasks avg, 1 vCPU / 2 GB | ~$240–600 |
+| RDS PostgreSQL | db.r6g.4xlarge, Multi-AZ | ~$2,000 |
+| RDS Read Replicas | db.r6g.2xlarge × 2 | ~$1,400 |
+| ElastiCache Redis | cache.r6g.2xlarge, 1 replica | ~$800 |
+| RDS Proxy | Standard usage | ~$150 |
+| ALB + CloudFront | Higher traffic | ~$100–200 |
+| **Total** | | **~$4,700–5,150/mo** |

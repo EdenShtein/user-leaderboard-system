@@ -83,6 +83,25 @@ Content-Type: application/json
 }
 ```
 
+**Response** `200`:
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "name": "Alice",
+  "score": 2500,
+  "applied": true,
+  ...
+}
+```
+
+Score updates are **monotonic**: the new score is only applied if it is strictly higher than the current score. If the submitted score is equal to or lower than the current score, the request succeeds (`200`) but the score is not changed and `applied` is `false`:
+
+```json
+{ "id": "...", "score": 2500, "applied": false, ... }
+```
+
+This prevents race conditions (a stale client retry overwriting a higher score) and matches gaming semantics where scores represent achievements.
+
 ### Get Top N Users
 
 ```bash
@@ -267,12 +286,13 @@ Detailed rationale for key architectural choices is documented under `docs/assum
 | **Edge Cases** | [edge-cases.md](docs/assumptions/edge-cases.md) | Score bounds, atomic updates, bottom-of-leaderboard, offset cap, idempotency, data reconciliation. |
 | **Test Framework** | [test-framework.md](docs/assumptions/test-framework.md) | Vitest over Jest — native TypeScript, zero config, identical API. Migration path documented. |
 | **Monitoring** | [monitoring.md](docs/assumptions/monitoring.md) | Datadog/CloudWatch metrics, structured logging, PagerDuty alerting — designed but not implemented. |
+| **Reliability Gaps** | [reliability-gaps.md](docs/assumptions/reliability-gaps.md) | Four reliability patterns considered but deferred for exercise scope: warm-up sentinel, drift reconciler, response metadata, shadow-key rebuild. Production priority order documented. |
 
 ## Production Considerations
 
 ### Rate Limiting
 
-The API includes built-in rate limiting via `@nestjs/throttler`:
+The API includes built-in rate limiting via `@nestjs/throttler` backed by Redis, making limits **global across all instances** rather than per-process:
 - **Read endpoints** (leaderboard): 100 requests/minute per IP
 - **Write endpoints** (create user): 30 requests/minute per IP
 - **Score updates**: 60 requests/minute per IP

@@ -85,6 +85,10 @@ export class RedisCacheService implements OnModuleInit, OnModuleDestroy {
     return this.redis.status === 'ready';
   }
 
+  getClient(): Redis {
+    return this.redis;
+  }
+
   // ── Member encoding helpers ──────────────────────────────────
 
   /**

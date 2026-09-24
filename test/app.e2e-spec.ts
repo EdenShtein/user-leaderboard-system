@@ -73,12 +73,34 @@ describe('Users API (e2e)', () => {
       .expect(400);
   });
 
-  it('PATCH /api/users/:id/score — should update score', async () => {
+  it('PATCH /api/users/:id/score — should update score and return applied: true', async () => {
     const res = await request(app.getHttpServer())
       .patch(`/api/users/${userId}/score`)
       .send({ score: 9999 })
       .expect(200);
 
+    expect(Number(res.body.score)).toBe(9999);
+    expect(res.body.applied).toBe(true);
+  });
+
+  it('PATCH /api/users/:id/score — should return applied: false for lower score', async () => {
+    // userId currently has score 9999 from the previous test
+    const res = await request(app.getHttpServer())
+      .patch(`/api/users/${userId}/score`)
+      .send({ score: 100 })
+      .expect(200);
+
+    expect(res.body.applied).toBe(false);
+    expect(Number(res.body.score)).toBe(9999);
+  });
+
+  it('PATCH /api/users/:id/score — should return applied: false for equal score', async () => {
+    const res = await request(app.getHttpServer())
+      .patch(`/api/users/${userId}/score`)
+      .send({ score: 9999 })
+      .expect(200);
+
+    expect(res.body.applied).toBe(false);
     expect(Number(res.body.score)).toBe(9999);
   });
 

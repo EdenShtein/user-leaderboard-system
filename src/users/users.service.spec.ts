@@ -105,7 +105,7 @@ describe('UsersService', () => {
   });
 
   describe('updateScore', () => {
-    it('should atomically update and return the user with new score', async () => {
+    it('should atomically update and return the user with new score and applied: true', async () => {
       const updated = { ...mockUser, score: 2000 };
       mockRepo.createQueryBuilder.mockReturnValue(mockQueryBuilder);
       mockQueryBuilder.execute.mockResolvedValue({ affected: 1, raw: [updated] });
@@ -113,20 +113,50 @@ describe('UsersService', () => {
       const result = await service.updateScore(mockUser.id, 2000);
 
       expect(result.score).toBe(2000);
+      expect(result.applied).toBe(true);
       expect(mockQueryBuilder.set).toHaveBeenCalledWith({ score: 2000 });
-      expect(mockQueryBuilder.where).toHaveBeenCalledWith('id = :id', { id: mockUser.id });
+      expect(mockQueryBuilder.where).toHaveBeenCalledWith('id = :id AND score < :newScore', {
+        id: mockUser.id,
+        newScore: 2000,
+      });
     });
 
-    it('should throw NotFoundException for non-existent user', async () => {
+    it('should throw NotFoundException when user does not exist', async () => {
       mockRepo.createQueryBuilder.mockReturnValue(mockQueryBuilder);
       mockQueryBuilder.execute.mockResolvedValue({ affected: 0, raw: [] });
+      mockRepo.findOne.mockResolvedValue(null);
 
       await expect(
         service.updateScore('non-existent-id', 100),
       ).rejects.toThrow(NotFoundException);
     });
 
-    it('should sync updated score to Redis', async () => {
+    it('should return applied: false when new score is not higher than current score', async () => {
+      mockRepo.createQueryBuilder.mockReturnValue(mockQueryBuilder);
+      // WHERE score < :newScore fails — new score (500) is lower than current (1000)
+      mockQueryBuilder.execute.mockResolvedValue({ affected: 0, raw: [] });
+      mockRepo.findOne.mockResolvedValue(mockUser);
+      mockRedis.isConnected.mockReturnValue(true);
+
+      const result = await service.updateScore(mockUser.id, 500);
+
+      expect(result.applied).toBe(false);
+      expect(result.score).toBe(mockUser.score);
+      expect(mockRedis.setUserScore).not.toHaveBeenCalled();
+    });
+
+    it('should return applied: false when new score equals current score', async () => {
+      mockRepo.createQueryBuilder.mockReturnValue(mockQueryBuilder);
+      mockQueryBuilder.execute.mockResolvedValue({ affected: 0, raw: [] });
+      mockRepo.findOne.mockResolvedValue(mockUser);
+
+      const result = await service.updateScore(mockUser.id, mockUser.score);
+
+      expect(result.applied).toBe(false);
+      expect(result.score).toBe(mockUser.score);
+    });
+
+    it('should sync updated score to Redis when applied', async () => {
       const updated = { ...mockUser, score: 2000 };
       mockRepo.createQueryBuilder.mockReturnValue(mockQueryBuilder);
       mockQueryBuilder.execute.mockResolvedValue({ affected: 1, raw: [updated] });

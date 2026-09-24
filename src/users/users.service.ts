@@ -22,28 +22,38 @@ export class UsersService {
     return saved;
   }
 
-  async updateScore(id: string, score: number): Promise<User> {
+  async updateScore(id: string, score: number): Promise<User & { applied: boolean }> {
+    // Monotonic guard: only apply if the new score is strictly higher than the current score.
+    // This prevents race conditions (concurrent retries with stale data overwriting a higher score)
+    // and aligns with gaming semantics where scores represent achievements.
     const result = await this.usersRepo
       .createQueryBuilder()
       .update(User)
       .set({ score })
-      .where('id = :id', { id })
+      .where('id = :id AND score < :newScore', { id, newScore: score })
       .returning('*')
       .execute();
 
-    if (result.affected === 0) {
-      throw new NotFoundException(`User ${id} not found`);
+    if (result.affected === 1) {
+      const raw = result.raw[0];
+      const saved: User = {
+        ...raw,
+        score: Number(raw.score),
+        createdAt: new Date(raw.createdAt),
+        updatedAt: new Date(raw.updatedAt),
+      };
+      await this.syncToRedis(saved);
+      return { ...saved, applied: true };
     }
 
-    const raw = result.raw[0];
-    const saved: User = {
-      ...raw,
-      score: Number(raw.score),
-      createdAt: new Date(raw.createdAt),
-      updatedAt: new Date(raw.updatedAt),
-    };
-    await this.syncToRedis(saved);
-    return saved;
+    // affected === 0 means either the user doesn't exist or the new score is not higher.
+    // Distinguish the two cases with a separate read.
+    const existing = await this.usersRepo.findOne({ where: { id } });
+    if (!existing) {
+      throw new NotFoundException(`User ${id} not found`);
+    }
+    // User exists but new score is not strictly higher than the current score.
+    return { ...existing, applied: false };
   }
 
   async findById(id: string): Promise<User> {
